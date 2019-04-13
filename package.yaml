@@ -39,6 +39,7 @@ executables:
     - lifted-base
     - mtl
     - network
+    - network-simple
     - stm
     - text
 

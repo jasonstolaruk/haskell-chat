@@ -1,8 +1,18 @@
 {-# LANGUAGE LambdaCase, OverloadedStrings, ViewPatterns #-}
--- {-# OPTIONS_GHC -Wall -Werror -Wno-type-defaults #-}
--- TODO: Uncomment the above after addressing library deprecation.
+{-# OPTIONS_GHC -Wall -Werror -Wno-type-defaults #-}
 
-module Main where
+{-
+TODO:
+Presently all the code is here, in this file. We need to properly organize the code into modules.
+This file can be the only file in the "app" directory.
+Under "src", there will be a number of distinct files/modules:
+* One module should contain all our data type declarations and type aliases. Doing this helps to avoid circular imports in large apps.
+* Other modules can be created based on theme. For example, one module might contain "Text" utility functions.
+* You'll probably want to put "threadServer" and the functions it calls ("interp") in a single module.
+Modules should only export the functions that other modules need.
+-}
+
+module Main (main) where
 
 import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.Async (Async, async, cancel, wait)
@@ -14,14 +24,14 @@ import Control.Monad (forever, void)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT, ask, runReaderT)
 import Data.Bool (bool)
-import Data.Function ((&))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Monoid ((<>))
 import Data.Text (Text)
 import Data.Typeable (Typeable)
 import GHC.Stack (HasCallStack)
-import Network (PortID(..), accept, listenOn, sClose) -- TODO: Deprecated!
-import System.IO (BufferMode(..), Handle, Newline(..), NewlineMode(..), hClose, hFlush, hIsEOF, hSetBuffering, hSetEncoding, hSetNewlineMode, latin1)
+import Network.Socket (socketToHandle)
+import Network.Simple.TCP (HostPreference(HostAny), ServiceName, SockAddr, accept, listen)
+import System.IO (BufferMode(LineBuffering), Handle, Newline(CRLF), NewlineMode(NewlineMode, inputNL, outputNL), IOMode(ReadWriteMode), hClose, hFlush, hIsEOF, hSetBuffering, hSetEncoding, hSetNewlineMode, latin1)
 import qualified Data.Text as T
 import qualified Data.Text.IO as T (hGetLine, hPutStr, putStrLn)
 
@@ -32,30 +42,10 @@ telnet localhost 9696
 -}
 
 {-
-TODO:
-Presently all the code is here, in this file. We need to properly organize the code into modules.
-This file can be the only file in the "app" directory.
-Under "src", there will be a number of distinct modules/files:
-* One module should contain all our data type declarations and type aliases. Doing this helps to avoid circular imports in large apps.
-* Other modules can be created based on theme. For example, one module might contain "Text" utility functions.
-* You'll probably want to put "threadServer" and the functions it calls ("interp") in a single module.
-Modules should only export the functions that other modules need.
--}
-
-{-
-TODO:
 Keep in mind that in Haskell, killing a parent thread does NOT kill its children threads!
 Threads must be manually managed via the "Async" library. This takes careful thought and consideration.
 Threads should never be "leaked:" we don't ever want a situation in which a child thread is left running and no other threads are aware of it.
 Of course, the app should be architected in such a way that when an exception is thrown, it is handled gracefully. First and foremost, an exception must be caught on/by the thread on which the exception was thrown. If the exception represents something critical or unexpected (it's a bug, etc. - this is the vast majority of exceptions that we'll encounter in practice), and the exception occurs on a child thread, then the child thread should rethrow the exception to the listen (main) thread. The listen thread's exception handler should catch the rethrown exception and gracefully shut down, manually killing all child threads in the process.
-Some of this architecture is already in place (there is a mechanism by which you can rethrow an exception to the listen thread), but it's not all here (not all threads have exception handlers yet, and you should think carefully about how to avoid thread leakage).
-For example, try this:
-1) Run "main" in the REPL.
-2) Connect to the server via telnet.
-3) Issue the "/throw" command.
-4) Notice you get the REPL prompt again. The main thread has died.
-5) Exit the telnet program.
-Why do you then see "Closing the handle for localhost." printed in the REPL?
 -}
 
 type ChatStack = ReaderT Env IO
@@ -82,17 +72,19 @@ threadListen :: HasCallStack => ChatStack ()
 threadListen = liftIO myThreadId >>= \ti -> do
     modifyState $ \cs -> (cs { listenThreadId = Just ti }, ())
     liftIO . T.putStrLn $ "Welcome to the Haskell Chat Server!"
-    listen `finally` bye
+    listenHelper `finally` bye
   where
     bye = liftIO . T.putStrLn . nl $ "Goodbye!"
 
-listen :: HasCallStack => ChatStack ()
-listen = handle listenExHandler $ port & liftIO . listenOn . PortNumber . fromIntegral >>= \sock ->
-    let loop = liftIO (accept sock) >>= \(h, T.pack -> host, showTxt -> localPort) -> do
-            liftIO . T.putStrLn . T.concat $ [ "Connected to ", host, " on local port ", localPort, "." ]
-            void . runAsync . threadTalk h $ host -- TODO: Hold on to the thread's "Async" data?
-        cleanUp = liftIO $ T.putStrLn (nlTxt <> "Closing the server socket.") >> sClose sock
-    in forever loop `finally` cleanUp
+listenHelper :: HasCallStack => ChatStack ()
+listenHelper = handle listenExHandler $ ask >>= \env ->
+    let listener = liftIO . listen HostAny port $ accepter
+        accepter (serverSocket, _) = forever . accept serverSocket $ talker
+        talker (clientSocket, remoteAddr) = do
+            T.putStrLn . T.concat $ [ "Connected to ", showTxt remoteAddr, "." ]
+            h <- socketToHandle clientSocket ReadWriteMode
+            void . async . runReaderT (threadTalk h remoteAddr) $ env -- TODO: Store the talk thread's "Async" data in the shared state.
+    in listener
 
 listenExHandler :: HasCallStack => SomeException -> ChatStack ()
 listenExHandler e = case fromException e of
@@ -103,20 +95,20 @@ listenExHandler e = case fromException e of
 
 -- This thread is spawned for every incoming connection.
 -- Its main responsibility is to spawn a "receive" and a "server" thread.
-threadTalk :: HasCallStack => Handle -> Text -> ChatStack ()
-threadTalk h host = talk `finally` liftIO cleanUp
+threadTalk :: HasCallStack => Handle -> SockAddr -> ChatStack ()
+threadTalk h addr = talk `finally` liftIO cleanUp
   where
-    -- TODO: Should handle exceptions gracefully.
+    -- TODO: Handle exceptions.
     talk = liftIO newTQueueIO >>= \mq -> do
         liftIO configBuffer
         (a, b) <- (,) <$> runAsync (threadReceive h mq) <*> runAsync (threadServer h mq)
         liftIO $ wait b >> cancel a
     configBuffer = hSetBuffering h LineBuffering >> hSetNewlineMode h nlMode >> hSetEncoding h latin1
     nlMode       = NewlineMode { inputNL = CRLF, outputNL = CRLF }
-    cleanUp      = T.putStrLn ("Closing the handle for " <> host <> ".") >> hClose h
+    cleanUp      = T.putStrLn ("Closing the handle for " <> showTxt addr <> ".") >> hClose h
 
 -- This thread polls the handle for the client's connection. Incoming text is sent down the message queue.
-threadReceive :: HasCallStack => Handle -> MsgQueue -> ChatStack () -- TODO: Should handle exceptions gracefully.
+threadReceive :: HasCallStack => Handle -> MsgQueue -> ChatStack () -- TODO: Handle exceptions.
 threadReceive h mq = mIf (liftIO . hIsEOF $ h) (writeMsg mq Dropped) $ do
     receive mq =<< liftIO (T.hGetLine h)
     threadReceive h mq
@@ -127,7 +119,7 @@ It is named "threadServer" because this is where the bulk of server operations a
 But keep in mind that this function is executed for every client, and thus the code we write here is written from the standpoint of a single client (ie, the arguments to this function are the handle and message queue of a single client).
 (Of course, we are in the "ChatStack" so we have access to the global shared state.)
 -}
-threadServer :: HasCallStack => Handle -> MsgQueue -> ChatStack () -- TODO: Should handle exceptions gracefully.
+threadServer :: HasCallStack => Handle -> MsgQueue -> ChatStack () -- TODO: Handle exceptions.
 threadServer h mq = readMsg mq >>= let loop = (>> threadServer h mq) in \case
   FromClient txt -> loop . interp mq $ txt
   FromServer txt -> loop . liftIO $ T.hPutStr h txt >> hFlush h
@@ -136,7 +128,7 @@ threadServer h mq = readMsg mq >>= let loop = (>> threadServer h mq) in \case
 interp :: HasCallStack => MsgQueue -> Text -> ChatStack ()
 interp mq txt = case T.toLower txt of
   "/quit"  -> send mq "See you next time!" >> writeMsg mq Dropped
-  "/throw" -> throwToListenThread . toException $ PleaseDie -- For illustration.
+  "/throw" -> throwToListenThread . toException $ PleaseDie -- For illustration/testing.
   _        -> send mq $ "I see you said, " <> dblQuote txt
 
 {-
@@ -177,8 +169,8 @@ throwToListenThread e = maybeVoid (`throwTo` e) . listenThreadId =<< getState
 --------------------
 -- Misc. bindings and utility functions
 
-port :: Int
-port = 9696
+port :: ServiceName
+port = "9696"
 
 -- Monadic "if".
 mIf :: (HasCallStack, Monad m) => m Bool -> m a -> m a -> m a
