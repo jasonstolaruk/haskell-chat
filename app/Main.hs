@@ -48,15 +48,25 @@ Threads should never be "leaked:" we don't ever want a situation in which a chil
 Of course, the app should be architected in such a way that when an exception is thrown, it is handled gracefully. First and foremost, an exception must be caught on/by the thread on which the exception was thrown. If the exception represents something critical or unexpected (it's a bug, etc. - this is the vast majority of exceptions that we'll encounter in practice), and the exception occurs on a child thread, then the child thread should rethrow the exception to the listen (main) thread. The listen thread's exception handler should catch the rethrown exception and gracefully shut down, manually killing all child threads in the process.
 -}
 
+{-
+TODO:
+To fix the thread leakage bug:
+* The "/throw" command should throw an exception on the receive thread.
+* The receive thread's exception handler should catch the exception and throw an exception to the listen thread.
+* The listen thread's exception handler should catch the exception and gracefully shut the server down by doing the following:
+1) Put a "Msg" in every "MsgQueue" indicating that the server is shutting down.
+2) Wait for every talk thread to finish.
+-}
+
 type ChatStack = ReaderT Env IO
 type Env       = IORef ChatState
-type MsgQueue  = TQueue ThreadMsg
+type MsgQueue  = TQueue Msg
 
 data ChatState = ChatState { listenThreadId :: Maybe ThreadId } -- TODO: We'll need to put all message queues in the state.
 
-data ThreadMsg = FromClient Text
-               | FromServer Text
-               | Dropped
+data Msg = FromClient Text
+         | FromServer Text
+         | Dropped
 
 data PleaseDie = PleaseDie deriving (Show, Typeable)
 instance Exception PleaseDie
@@ -143,10 +153,10 @@ getState = liftIO . readIORef =<< ask
 modifyState :: HasCallStack => (ChatState -> (ChatState, a)) -> ChatStack a
 modifyState f = ask >>= \ref -> liftIO . atomicModifyIORef' ref $ f
 
-readMsg :: HasCallStack => MsgQueue -> ChatStack ThreadMsg
+readMsg :: HasCallStack => MsgQueue -> ChatStack Msg
 readMsg = liftIO . atomically . readTQueue
 
-writeMsg :: HasCallStack => MsgQueue -> ThreadMsg -> ChatStack ()
+writeMsg :: HasCallStack => MsgQueue -> Msg -> ChatStack ()
 writeMsg mq = liftIO . atomically . writeTQueue mq
 
 send :: HasCallStack => MsgQueue -> Text -> ChatStack ()
