@@ -51,8 +51,8 @@ Of course, the app should be architected in such a way that when an exception is
 {-
 TODO:
 To fix the thread leakage bug:
-* The "/throw" command should throw an exception on the receive thread.
-* The receive thread's exception handler should catch the exception and throw an exception to the listen thread.
+* The "/throw" command should throw an exception on the server thread.
+* The server thread's exception handler should catch the exception and throw an exception to the listen thread.
 * The listen thread's exception handler should catch the exception and gracefully shut the server down by doing the following:
 1) Put a "Msg" in every "MsgQueue" indicating that the server is shutting down.
 2) Wait for every talk thread to finish.
